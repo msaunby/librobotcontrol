@@ -99,3 +99,72 @@ Notes for endurance testing:
 - Logging is local on the BeagleBone, so Wi-Fi dropouts do not stop capture.
 - Each CSV row is flushed and synced to disk to reduce data loss if power fails.
 - Default thresholds: explore-ready cell >= 3.95V, stop test at cell <= 3.30V.
+
+---
+
+Current project status (latest verified)
+
+- Robot TCP control server is working for FORWARD, BACKWARD, TURN, STOP, HOME, STATUS.
+- Motor ramping path is active and driver calls are succeeding (motor_m0_ret=0, motor_m1_ret=0 in STATUS).
+- Gyro heading integration is active and responsive.
+- Compass path is active and now tilt-compensated; compass_deg and raw mag fields change across samples.
+- Magnetometer health during latest checks: compass_valid=1, mag_errors=0, mag_samples increasing.
+- Calibration sequence script has been created and run successfully from the controlling laptop.
+
+Latest useful test artifacts
+
+- Calibration log file from latest full sequence:
+
+	calibration_logs/calibration_run_20260512_152157.jsonl
+
+- This run captured all three phases (A/B/C), had 100% STATUS parse success, and zero magnetometer read errors.
+
+How to re-run key tests
+
+1) Build and start server on BeagleBone
+
+- from rc_project_template:
+
+	make build-server
+	make server-start-bg
+
+2) Quick live status check from laptop
+
+- run from controlling laptop:
+
+	nc beaglebone.local 5000
+
+- then send:
+
+	STATUS
+	FORWARD 0.30
+	STATUS
+	STOP
+	STATUS
+
+3) Full guided calibration sequence (recommended)
+
+- from repository root on laptop:
+
+	python3 scripts/run_calibration_sequence.py --auto-start --auto-stop
+
+- output log path pattern:
+
+	calibration_logs/calibration_run_YYYYMMDD_HHMMSS.jsonl
+
+4) Validate battery and external power state before motion tests
+
+- on BeagleBone in rc_project_template:
+
+	make preflight
+
+- expected for battery-only testing:
+
+	cell >= 3.95V and DC Jack near 0.00V
+
+Suggested restart workflow after a break
+
+- Pull latest code in both repos.
+- In rc_project_template, run: make build-server
+- Run one quick STATUS/FORWARD/STOP sanity check.
+- Run full calibration script once and compare new log metrics against the latest baseline above.
