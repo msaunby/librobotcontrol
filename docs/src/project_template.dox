@@ -1,6 +1,9 @@
 
 /** \page project_template Project Template
 
+\note **New Modular Architecture**: For robot control applications, see the modular experiments/ directory structure including robot_server for TCP-based heading control, battery/ for endurance testing, motors/ for motor validation, and components/ for reusable motor_control and heading_control modules.
+
+
 We highly suggest using or at least studying the rc_project_template available at <https://github.com/StrawsonDesign/librobotcontrol/tree/master/rc_project_template>.
 
 

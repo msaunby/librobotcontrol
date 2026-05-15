@@ -1075,7 +1075,7 @@ EXCLUDE_SYMBOLS        =
 
 EXAMPLE_PATH           = ../examples/src/ \
                          ../library/include \
-                         ../rc_project_template
+                         ../experiments
 
 # If the value of the EXAMPLE_PATH tag contains directories, you can use the
 # EXAMPLE_PATTERNS tag to specify one or more wildcard pattern (like *.cpp and
