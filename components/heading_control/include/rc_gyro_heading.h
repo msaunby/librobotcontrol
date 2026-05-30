@@ -22,6 +22,7 @@
 typedef struct {
     double heading_deg;         ///< Integrated gyro heading [-180, +180]
     double last_gyro_z_dps;     ///< Last gyro Z rate in deg/s
+    double last_accel[3];       ///< Latest accelerometer XYZ in m/s^2
     double compass_deg;         ///< Latest magnetometer bearing [-180, +180]
     int    compass_valid;        ///< 1 once the first mag reading succeeds
     double mag_x_ut;            ///< Latest raw magnetometer X field (uT)
@@ -68,6 +69,14 @@ int gyro_heading_get_mag_raw(gyro_heading_t *heading, double *mag_x, double *mag
 
 /** @brief Get total successful and failed magnetometer read counts. */
 int gyro_heading_get_mag_counters(gyro_heading_t *heading, int *sample_count, int *error_count);
+
+/**
+ * @brief Get the latest accelerometer readings in m/s^2.
+ *
+ * Returns 0 on success. Values are protected by the internal mutex and
+ * reflect the most recent 100 Hz gyro/accel sample.
+ */
+int gyro_heading_get_accel(gyro_heading_t *heading, double *ax, double *ay, double *az);
 
 /**
  * @brief Reseed the integrated gyro heading from the latest magnetometer reading.

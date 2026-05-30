@@ -28,6 +28,22 @@
  *   SET_DECEL <rate>     Deceleration rate (duty/sec)
  *   SET_GAIN <kp>        Heading correction proportional gain
  *   SET_TOL <deg>        Heading error tolerance in degrees
+ *   COLLISION on         Enable collision detection (Forward/Backward/ROT)
+ *   COLLISION off        Disable collision detection
+ *   COLLISION threshold <t>  Set accel spike threshold above 1g in m/s^2
+ *   COLLISION rotstall <min_rate_dps> <per_duty_dps> <hold_ms>
+ *                        Set adaptive ROT stall detector parameters
+ *                        (legacy form: COLLISION rotstall <rate_dps> <hold_ms>)
+ *   COLLISION status     Report enabled state and threshold
+ *
+ * Collision detection:
+ *   When enabled, Forward, Backward, and ROT moves are monitored at 50 Hz via the
+ *   accelerometer already used by the heading thread.  If the total
+ *   acceleration magnitude exceeds (9.81 + threshold) m/s^2 — indicating a
+ *   sudden deceleration spike — motors brake immediately and the command
+ *   returns "COLLISION" instead of "OK".
+ *   Detection is inhibited for the first 400 ms of each move to avoid false
+ *   positives from the motor ramp-up transient.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -84,6 +100,14 @@ static void us_sleep(int us) {
 #define ROT_SLOWDOWN_DEG          90.0
 #define ROT_MIN_DUTY              0.08
 #define ROT_DEBUG                 1
+#define ROT_STALL_MIN_RATE_DPS    5.0   ///< Minimum ROT stall threshold (dps)
+#define ROT_STALL_PER_DUTY_DPS   25.0   ///< Additional threshold per duty unit
+#define ROT_STALL_HOLD_US      300000   ///< Low-rate duration required to trigger stall
+
+// Collision detection defaults
+#define DEFAULT_COLLISION_THRESHOLD_MS2  4.0f  ///< Spike above g threshold (m/s^2)
+#define COLLISION_STARTUP_SKIP_US       400000  ///< Ignore first 400ms of move
+#define COLLISION_POLL_INTERVAL_US       20000  ///< Poll at 50 Hz
 
 // Calibration from measured run: 0.155 m at duty 0.10 over 6.0 s.
 // --- Sensor-feedback closed-loop rotate ---
@@ -128,6 +152,11 @@ typedef struct {
     straight_t       straight;
     pose_t           pose;
     geofence_t       geofence;
+    int              collision_detect;        ///< 1 if collision detection enabled
+    float            collision_threshold_ms2; ///< Accel spike threshold above g
+    float            rot_stall_min_rate_dps;  ///< ROT stall min rate threshold
+    float            rot_stall_per_duty_dps;  ///< ROT stall rate gain per duty
+    int              rot_stall_hold_us;       ///< ROT low-rate hold duration
     pthread_mutex_t  ctrl_mutex;
     pthread_t        ctrl_thread;
     time_t           last_cmd_time;
@@ -234,7 +263,7 @@ static void* control_thread_func(void *arg)
 /* -------------------------------------------------------------------------
  * Command implementations
  * ---------------------------------------------------------------------- */
-static void run_fixed_distance_motion(srv_t *s, float duty, float direction)
+static int run_fixed_distance_motion(srv_t *s, float duty, float direction)
 {
     duty = fmaxf(0.05f, fminf(s->motor_ramp.max_duty, duty));
     double ref = reseed_heading(s);
@@ -265,34 +294,67 @@ static void run_fixed_distance_motion(srv_t *s, float duty, float direction)
     pthread_mutex_unlock(&s->ctrl_mutex);
     // Start moving
     motor_ramp_set_target(&s->motor_ramp, direction * duty, direction * duty);
-    // Sleep for required time
+    // Poll at 50 Hz for the planned move duration, checking for collision.
+    // Detection is skipped for the first COLLISION_STARTUP_SKIP_US to avoid
+    // false positives from the motor ramp-up transient.
     int run_time_us = (int)(run_time_s * 1e6);
-    us_sleep(run_time_us);
-    // Stop after move window. Use brake to avoid extra travel from ramped decel.
+    int elapsed_us  = 0;
+    int collision   = 0;
+    while (elapsed_us < run_time_us && !g_shutdown) {
+        int step = (elapsed_us + COLLISION_POLL_INTERVAL_US <= run_time_us)
+                   ? COLLISION_POLL_INTERVAL_US
+                   : (run_time_us - elapsed_us);
+        us_sleep(step);
+        elapsed_us += step;
+
+        pthread_mutex_lock(&s->ctrl_mutex);
+        int   detect = s->collision_detect;
+        float thresh = s->collision_threshold_ms2;
+        pthread_mutex_unlock(&s->ctrl_mutex);
+
+        if (detect && elapsed_us >= COLLISION_STARTUP_SKIP_US) {
+            double ax, ay, az;
+            if (gyro_heading_get_accel(&s->heading, &ax, &ay, &az) == 0) {
+                double total = sqrt(ax*ax + ay*ay + az*az);
+                if (total > 9.81 + (double)thresh) {
+                    printf("[collision] detected: |accel|=%.2f m/s^2 (threshold=9.81+%.2f)\n",
+                           total, (double)thresh);
+                    collision = 1;
+                    break;
+                }
+            }
+        }
+    }
+    // Stop after move (or collision). Brake immediately to avoid extra travel.
+    float actual_time_s = (float)elapsed_us / 1.0e6f;
     pthread_mutex_lock(&s->ctrl_mutex);
     s->straight.active    = 0;
     s->straight.base_duty = 0.0f;
-    
-    // Update pose based on completed motion
+
+    // Update pose based on actual elapsed time (shorter if collision aborted early)
     double heading_rad = ref * M_PI / 180.0;
-    s->pose.x_m += (run_time_s * FORWARD_M_PER_SEC_AT_FULL_DUTY * duty) * cos(heading_rad) * direction;
-    s->pose.y_m += (run_time_s * FORWARD_M_PER_SEC_AT_FULL_DUTY * duty) * sin(heading_rad) * direction;
-    printf("[pose] after move: x=%.4f y=%.4f h=%.2f\n", s->pose.x_m, s->pose.y_m, s->pose.heading_deg);
-    
+    float  pose_time   = collision ? actual_time_s : run_time_s;
+    s->pose.x_m += (double)(pose_time * FORWARD_M_PER_SEC_AT_FULL_DUTY * duty) * cos(heading_rad) * (double)direction;
+    s->pose.y_m += (double)(pose_time * FORWARD_M_PER_SEC_AT_FULL_DUTY * duty) * sin(heading_rad) * (double)direction;
+    printf("[pose] after move: x=%.4f y=%.4f h=%.2f%s\n",
+           s->pose.x_m, s->pose.y_m, s->pose.heading_deg,
+           collision ? " (collision)" : "");
+
     pthread_mutex_unlock(&s->ctrl_mutex);
     motor_ramp_brake(&s->motor_ramp);
     us_sleep(50000);
+    return collision;
 }
 
 // Move forward a fixed distance (in meters) at the given duty (speed)
-static void cmd_forward(srv_t *s, float duty)
+static int cmd_forward(srv_t *s, float duty)
 {
-    run_fixed_distance_motion(s, duty, 1.0f);
+    return run_fixed_distance_motion(s, duty, 1.0f);
 }
 
-static void cmd_backward(srv_t *s, float duty)
+static int cmd_backward(srv_t *s, float duty)
 {
-    run_fixed_distance_motion(s, duty, -1.0f);
+    return run_fixed_distance_motion(s, duty, -1.0f);
 }
 
 static void cmd_pose(srv_t *s, char *response, size_t resp_len)
@@ -417,7 +479,7 @@ static void cmd_home(srv_t *s)
 /* -------------------------------------------------------------------------
  * Command dispatcher
  * ---------------------------------------------------------------------- */
-static void cmd_rot(srv_t *s, float duty, float deg)
+static int cmd_rot(srv_t *s, float duty, float deg)
 {
     duty = fmaxf(0.0f, fminf(s->motor_ramp.max_duty, duty));
     pthread_mutex_lock(&s->ctrl_mutex);
@@ -434,7 +496,7 @@ static void cmd_rot(srv_t *s, float duty, float deg)
     if (duty <= 0.0f || fabs(deg) <= ROT_TOLERANCE_DEG) {
         motor_ramp_brake(&s->motor_ramp);
         reseed_heading(s);
-        return;
+        return 0;
     }
 
     // Scale duty by angle: small angles get less duty to avoid overshoot
@@ -443,6 +505,9 @@ static void cmd_rot(srv_t *s, float duty, float deg)
 
     int settle_count = 0;
     int iter = 0;
+    int elapsed_us = 0;
+    int stall_us = 0;
+    int collision = 0;
     time_t t0 = time(NULL);
     while (!g_shutdown && (time(NULL) - t0) < ROT_TIMEOUT_SEC) {
         double heading = gyro_heading_get_deg(&s->heading);
@@ -458,11 +523,54 @@ static void cmd_rot(srv_t *s, float duty, float deg)
         }
         iter++;
 
+        pthread_mutex_lock(&s->ctrl_mutex);
+        int   detect = s->collision_detect;
+        float thresh = s->collision_threshold_ms2;
+        float stall_min_rate_dps = s->rot_stall_min_rate_dps;
+        float stall_per_duty_dps = s->rot_stall_per_duty_dps;
+        int   stall_hold_us = s->rot_stall_hold_us;
+        pthread_mutex_unlock(&s->ctrl_mutex);
+
+        if (detect && elapsed_us >= COLLISION_STARTUP_SKIP_US) {
+            double ax, ay, az;
+            if (gyro_heading_get_accel(&s->heading, &ax, &ay, &az) == 0) {
+                double total = sqrt(ax*ax + ay*ay + az*az);
+                if (total > 9.81 + (double)thresh) {
+                    printf("[collision] detected during ROT: |accel|=%.2f m/s^2 (threshold=9.81+%.2f)\n",
+                           total, (double)thresh);
+                    collision = 1;
+                    break;
+                }
+            }
+
+            // ROT is slower than linear moves. Also detect a likely collision
+            // when commanded rotation is not producing expected angular rate.
+            if (abs_err > (ROT_TOLERANCE_DEG * 2.0)) {
+                double rate_dps = fabs(gyro_heading_get_rate_dps(&s->heading));
+                double expected_min_rate_dps = fmax((double)stall_min_rate_dps,
+                                                    (double)stall_per_duty_dps * (double)scaled_duty);
+                if (rate_dps < expected_min_rate_dps) {
+                    stall_us += 25000;
+                    if (stall_us >= stall_hold_us) {
+                        printf("[collision] detected during ROT stall: |gyro_z|=%.2f dps < %.2f dps for %d ms\n",
+                               rate_dps, expected_min_rate_dps, stall_us / 1000);
+                        collision = 1;
+                        break;
+                    }
+                } else {
+                    stall_us = 0;
+                }
+            } else {
+                stall_us = 0;
+            }
+        }
+
         if (abs_err <= ROT_TOLERANCE_DEG) {
             settle_count++;
             motor_ramp_set_target(&s->motor_ramp, 0.0f, 0.0f);
             if (settle_count >= ROT_SETTLE_SAMPLES) break;
             us_sleep(25000);
+            elapsed_us += 25000;
             continue;
         }
         settle_count = 0;
@@ -471,15 +579,18 @@ static void cmd_rot(srv_t *s, float duty, float deg)
         float right_duty = (err > 0.0) ?  scaled_duty : -scaled_duty;
         motor_ramp_set_target(&s->motor_ramp, left_duty, right_duty);
         us_sleep(25000);
+        elapsed_us += 25000;
     }
     motor_ramp_brake(&s->motor_ramp);
     // Update heading in pose after turn completes
     double final_heading = gyro_heading_get_deg(&s->heading);
     pthread_mutex_lock(&s->ctrl_mutex);
     s->pose.heading_deg = final_heading;
-    printf("[pose] after ROT: h=%.2f\n", s->pose.heading_deg);
+    printf("[pose] after ROT: h=%.2f%s\n", s->pose.heading_deg,
+           collision ? " (collision)" : "");
     pthread_mutex_unlock(&s->ctrl_mutex);
     reseed_heading(s);
+    return collision;
 }
 
 static void process_command(srv_t *s, const char *line,
@@ -511,8 +622,8 @@ static void process_command(srv_t *s, const char *line,
             printf("[geofence] FORWARD blocked at (%.4f, %.4f) -> (%.4f, %.4f)\n",
                    cur_x, cur_y, next_x, next_y);
         } else {
-            cmd_forward(s, duty);
-            snprintf(response, resp_len, "OK\n");
+            int r = cmd_forward(s, duty);
+            snprintf(response, resp_len, r ? "COLLISION\n" : "OK\n");
         }
 
     } else if (strcasecmp(cmd, "BACKWARD") == 0) {
@@ -535,8 +646,8 @@ static void process_command(srv_t *s, const char *line,
             printf("[geofence] BACKWARD blocked at (%.4f, %.4f) -> (%.4f, %.4f)\n",
                    cur_x, cur_y, next_x, next_y);
         } else {
-            cmd_backward(s, duty);
-            snprintf(response, resp_len, "OK\n");
+            int r = cmd_backward(s, duty);
+            snprintf(response, resp_len, r ? "COLLISION\n" : "OK\n");
         }
 
 
@@ -551,8 +662,8 @@ static void process_command(srv_t *s, const char *line,
         float duty = 0.0f, deg = 0.0f;
         if (sscanf(line, "ROT %f %f", &duty, &deg) != 2) {
             snprintf(response, resp_len, "ERR ROT <duty> <deg>\n"); return; }
-        cmd_rot(s, duty, deg);
-        snprintf(response, resp_len, "OK\n");
+        int r = cmd_rot(s, duty, deg);
+        snprintf(response, resp_len, r ? "COLLISION\n" : "OK\n");
 
     } else if (strcasecmp(cmd, "STOP") == 0) {
         cmd_stop(s);
@@ -689,6 +800,72 @@ static void process_command(srv_t *s, const char *line,
             snprintf(response, resp_len, "ERR GEOFENCE subcommand unknown: %s\n", subcmd);
         }
 
+    } else if (strcasecmp(cmd, "COLLISION") == 0) {
+        char subcmd[32];
+        if (sscanf(line, "COLLISION %31s", subcmd) != 1) {
+            snprintf(response, resp_len, "ERR COLLISION <on|off|threshold|rotstall|status>\n"); return; }
+
+        if (strcasecmp(subcmd, "on") == 0) {
+            pthread_mutex_lock(&s->ctrl_mutex);
+            s->collision_detect = 1;
+            pthread_mutex_unlock(&s->ctrl_mutex);
+            snprintf(response, resp_len, "OK\n");
+            printf("[collision] detection enabled\n");
+        } else if (strcasecmp(subcmd, "off") == 0) {
+            pthread_mutex_lock(&s->ctrl_mutex);
+            s->collision_detect = 0;
+            pthread_mutex_unlock(&s->ctrl_mutex);
+            snprintf(response, resp_len, "OK\n");
+            printf("[collision] detection disabled\n");
+        } else if (strcasecmp(subcmd, "threshold") == 0) {
+            float thresh = 0.0f;
+            if (sscanf(line, "COLLISION threshold %f", &thresh) != 1) {
+                snprintf(response, resp_len, "ERR COLLISION threshold <m/s^2>\n"); return; }
+            pthread_mutex_lock(&s->ctrl_mutex);
+            s->collision_threshold_ms2 = thresh;
+            pthread_mutex_unlock(&s->ctrl_mutex);
+            snprintf(response, resp_len, "OK\n");
+            printf("[collision] threshold set to %.2f m/s^2\n", (double)thresh);
+        } else if (strcasecmp(subcmd, "rotstall") == 0) {
+            float min_rate_dps = 0.0f;
+            float per_duty_dps = 0.0f;
+            int hold_ms = 0;
+            // New format: COLLISION rotstall <min_rate_dps> <per_duty_dps> <hold_ms>
+            // Legacy format: COLLISION rotstall <rate_dps> <hold_ms>
+            int parsed = sscanf(line, "COLLISION rotstall %f %f %d", &min_rate_dps, &per_duty_dps, &hold_ms);
+            if (parsed == 2) {
+                // Legacy fixed-threshold behavior
+                hold_ms = (int)per_duty_dps;
+                per_duty_dps = 0.0f;
+            } else if (parsed != 3) {
+                snprintf(response, resp_len,
+                         "ERR COLLISION rotstall <min_rate_dps> <per_duty_dps> <hold_ms>\n"); return;
+            }
+            if (min_rate_dps <= 0.0f || per_duty_dps < 0.0f || hold_ms <= 0) {
+                snprintf(response, resp_len, "ERR COLLISION rotstall expects positive values\n"); return; }
+            pthread_mutex_lock(&s->ctrl_mutex);
+            s->rot_stall_min_rate_dps = min_rate_dps;
+            s->rot_stall_per_duty_dps = per_duty_dps;
+            s->rot_stall_hold_us = hold_ms * 1000;
+            pthread_mutex_unlock(&s->ctrl_mutex);
+            snprintf(response, resp_len, "OK\n");
+            printf("[collision] ROT stall params set: min=%.2f dps per_duty=%.2f hold=%d ms\n",
+                   (double)min_rate_dps, (double)per_duty_dps, hold_ms);
+        } else if (strcasecmp(subcmd, "status") == 0) {
+            pthread_mutex_lock(&s->ctrl_mutex);
+            int   det    = s->collision_detect;
+            float thresh = s->collision_threshold_ms2;
+            float stall_min_rate_dps = s->rot_stall_min_rate_dps;
+            float stall_per_duty_dps = s->rot_stall_per_duty_dps;
+            int   stall_hold_ms = s->rot_stall_hold_us / 1000;
+            pthread_mutex_unlock(&s->ctrl_mutex);
+            snprintf(response, resp_len,
+                "{\"enabled\":%d,\"threshold_ms2\":%.2f,\"rot_stall_min_rate_dps\":%.2f,\"rot_stall_per_duty_dps\":%.2f,\"rot_stall_hold_ms\":%d}\n",
+                det, (double)thresh, (double)stall_min_rate_dps, (double)stall_per_duty_dps, stall_hold_ms);
+        } else {
+            snprintf(response, resp_len, "ERR COLLISION subcommand unknown: %s\n", subcmd);
+        }
+
     } else {
         snprintf(response, resp_len, "ERR unknown: %s\n", cmd);
     }
@@ -707,6 +884,9 @@ static void print_usage(const char *prog)
     printf("  --heading-gain K   Straight-line correction gain (default %.2f)\n", DEFAULT_HEADING_GAIN);
     printf("  --heading-tol T    Dead-band degrees (default %.1f)\n", DEFAULT_STRAIGHT_TOL_DEG);
     printf("  --watchdog-sec N   Client silence timeout (default %d)\n", DEFAULT_WATCHDOG_SEC);
+    printf("  --collision        Enable collision detection at startup (default: off)\n");
+    printf("  --collision-threshold T  Accel spike threshold above 1g in m/s^2 (default %.1f)\n",
+           (double)DEFAULT_COLLISION_THRESHOLD_MS2);
     printf("  --help\n");
 }
 
@@ -732,6 +912,12 @@ int main(int argc, char *argv[])
     s.geofence.max_x_m       =  1.0;
     s.geofence.min_y_m       = -1.0;
     s.geofence.max_y_m       =  1.0;
+    // Collision detection: disabled by default
+    s.collision_detect        = 0;
+    s.collision_threshold_ms2 = DEFAULT_COLLISION_THRESHOLD_MS2;
+    s.rot_stall_min_rate_dps  = (float)ROT_STALL_MIN_RATE_DPS;
+    s.rot_stall_per_duty_dps  = (float)ROT_STALL_PER_DUTY_DPS;
+    s.rot_stall_hold_us       = ROT_STALL_HOLD_US;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--help"))        { print_usage(argv[0]); return 0; }
@@ -742,6 +928,8 @@ int main(int argc, char *argv[])
         else if (!strcmp(argv[i], "--heading-gain") && i+1<argc) s.straight.kp            = atof(argv[++i]);
         else if (!strcmp(argv[i], "--heading-tol")  && i+1<argc) s.straight.tolerance_deg = atof(argv[++i]);
         else if (!strcmp(argv[i], "--watchdog-sec") && i+1<argc) s.watchdog_sec           = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--collision"))                  s.collision_detect        = 1;
+        else if (!strcmp(argv[i], "--collision-threshold") && i+1<argc) s.collision_threshold_ms2 = (float)atof(argv[++i]);
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
     }
 
@@ -786,11 +974,12 @@ int main(int argc, char *argv[])
     }
 
     printf("[rc_robot_server] port=%d max_duty=%.2f accel=%.2f/s decel=%.2f/s "
-           "gain=%.2f tol=%.1fdeg watchdog=%ds\n",
+           "gain=%.2f tol=%.1fdeg watchdog=%ds collision=%s(%.1f m/s^2)\n",
            s.port,
            (double)s.motor_ramp.max_duty, (double)s.motor_ramp.accel_rate,
            (double)s.motor_ramp.decel_rate,
-           s.straight.kp, s.straight.tolerance_deg, s.watchdog_sec);
+           s.straight.kp, s.straight.tolerance_deg, s.watchdog_sec,
+           s.collision_detect ? "on " : "off ", (double)s.collision_threshold_ms2);
 
     while (!g_shutdown) {
         struct sockaddr_in cli;

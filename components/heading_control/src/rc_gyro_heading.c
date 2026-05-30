@@ -99,6 +99,9 @@ static void* gyro_heading_thread_func(void *arg)
             h->last_gyro_z_dps  = gyro_z_dps;
             h->heading_deg     += gyro_z_dps * HEADING_DT;
             h->heading_deg      = wrap_angle(h->heading_deg);
+            h->last_accel[0]    = acc_x;
+            h->last_accel[1]    = acc_y;
+            h->last_accel[2]    = acc_z;
             pthread_mutex_unlock(&h->mutex);
         }
 
@@ -146,6 +149,9 @@ int gyro_heading_init(gyro_heading_t *heading)
 
     heading->heading_deg     = 0.0;
     heading->last_gyro_z_dps = 0.0;
+    heading->last_accel[0]   = 0.0;
+    heading->last_accel[1]   = 0.0;
+    heading->last_accel[2]   = 0.0;
     heading->compass_deg     = 0.0;
     heading->compass_valid   = 0;
     heading->mag_x_ut        = 0.0;
@@ -194,6 +200,17 @@ double gyro_heading_get_rate_dps(gyro_heading_t *heading)
     double rate = heading->last_gyro_z_dps;
     pthread_mutex_unlock(&heading->mutex);
     return rate;
+}
+
+int gyro_heading_get_accel(gyro_heading_t *heading, double *ax, double *ay, double *az)
+{
+    if (!heading || !ax || !ay || !az) return -1;
+    pthread_mutex_lock(&heading->mutex);
+    *ax = heading->last_accel[0];
+    *ay = heading->last_accel[1];
+    *az = heading->last_accel[2];
+    pthread_mutex_unlock(&heading->mutex);
+    return 0;
 }
 
 double gyro_heading_get_compass_deg(gyro_heading_t *heading)
